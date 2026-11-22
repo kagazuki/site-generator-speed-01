@@ -1,12 +1,13 @@
 // Fast drop-in static site generator for makefun-site 1.0.0
-// Highly optimized:
-// 1. Chunked zero-redundancy inline markdown scanner with fast character checks
-// 2. Linear regex-free string escaping
-// 3. Optimized scope lookup and template evaluator
-// 4. Inlined pipeline stages
+// Ultra-optimized FastSite v3:
+// 1. AST JIT-Compiler for all templates (compiled to native JS functions)
+// 2. Fast regex guard for inline markdown (skips plain paragraphs in 1 check)
+// 3. Chunked zero-redundancy inline scanner with fast code-point lookup
+// 4. Linear HTML escaper without regex
+// 5. Inlined pipeline stages
 
 import { parseFrontMatter } from './vendor/makefun-site/lib/frontmatter.js';
-import { parseTemplate, TemplateError, INCLUDE_DEPTH } from './vendor/makefun-site/lib/template.js';
+import { parseTemplate, TemplateError } from './vendor/makefun-site/lib/template.js';
 import { longDate, slugify, uniqueSlug } from './vendor/makefun-site/lib/text.js';
 
 const REPORT_FILE = 'build-report.txt';
@@ -15,6 +16,7 @@ const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
+const TRIGGER_REGEX = /[\\`*\[&<>"']/;
 
 function fastEscape(text) {
   if (text === '') return '';
@@ -95,6 +97,8 @@ function findSingleStarFast(s, from) {
 }
 
 function fastInline(s, env) {
+  if (!TRIGGER_REGEX.test(s)) return s;
+
   let out = '';
   let i = 0;
   const len = s.length;
@@ -278,7 +282,7 @@ function renderMarkdownFast(src, env) {
   return { html: blocks.map((b) => `${b}\n`).join(''), toc, excerpt: excerpt ?? '' };
 }
 
-// Fast Template Rendering
+// Fast Template Engine & JIT Compiler
 function lookupFast(scope, path) {
   let s = scope;
   const p0 = path[0];
@@ -306,43 +310,64 @@ function truthyFast(v) {
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
-function renderNodesFast(nodes, scope, ctx, depth) {
-  let out = '';
-  for (const n of nodes) {
+function compileAST(nodes) {
+  let code = '';
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
     switch (n.kind) {
       case 'text':
-        out += n.text;
+        code += `out += ${JSON.stringify(n.text)};\n`;
         break;
       case 'var':
-        out += fastEscape(textOfFast(lookupFast(scope, n.path)));
+        code += `out += escape(textOf(lookup(scope, ${JSON.stringify(n.path)})));\n`;
         break;
       case 'raw':
-        out += textOfFast(lookupFast(scope, n.path));
+        code += `out += textOf(lookup(scope, ${JSON.stringify(n.path)}));\n`;
         break;
       case 'if': {
-        const v = truthyFast(lookupFast(scope, n.path));
-        const branch = v !== n.not ? n.then : n.else;
-        if (branch !== null) out += renderNodesFast(branch, scope, ctx, depth);
+        const cond = n.not
+          ? `!truthy(lookup(scope, ${JSON.stringify(n.path)}))`
+          : `truthy(lookup(scope, ${JSON.stringify(n.path)}))`;
+        code += `if (${cond}) {\n`;
+        code += compileAST(n.then);
+        if (n.else !== null) {
+          code += `} else {\n`;
+          code += compileAST(n.else);
+        }
+        code += `}\n`;
         break;
       }
       case 'for': {
-        const xs = lookupFast(scope, n.path);
-        if (!Array.isArray(xs)) break;
-        const xLen = xs.length;
-        for (let k = 0; k < xLen; k++) {
-          const vars = { [n.name]: xs[k], loop: { index: k + 1, first: k === 0, last: k === xLen - 1, length: xLen } };
-          out += renderNodesFast(n.body, { vars, parent: scope }, ctx, depth);
-        }
+        code += `{\n`;
+        code += `  const xs = lookup(scope, ${JSON.stringify(n.path)});\n`;
+        code += `  if (Array.isArray(xs)) {\n`;
+        code += `    const len = xs.length;\n`;
+        code += `    for (let k = 0; k < len; k++) {\n`;
+        code += `      const scope2 = { vars: { ${JSON.stringify(n.name)}: xs[k], loop: { index: k + 1, first: k === 0, last: k === len - 1, length: len } }, parent: scope };\n`;
+        code += `      {\n`;
+        code += `        const scope = scope2;\n`;
+        code += compileAST(n.body);
+        code += `      }\n`;
+        code += `    }\n`;
+        code += `  }\n`;
+        code += `}\n`;
         break;
       }
       case 'include': {
-        const t = ctx.templates.get(n.name);
-        if (t !== undefined && depth < INCLUDE_DEPTH) out += renderNodesFast(t, scope, ctx, depth + 1);
+        code += `if (depth < 8) {\n`;
+        code += `  const fn = compiled.get(${JSON.stringify(n.name)});\n`;
+        code += `  if (fn !== undefined) out += fn(scope, compiled, escape, textOf, lookup, truthy, depth + 1);\n`;
+        code += `}\n`;
         break;
       }
     }
   }
-  return out;
+  return code;
+}
+
+function makeCompiledTemplate(nodes) {
+  const body = `let out = "";\n` + compileAST(nodes) + `return out;\n`;
+  return new Function('scope', 'compiled', 'escape', 'textOf', 'lookup', 'truthy', 'depth', body);
 }
 
 const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longDate(s.data.date) });
@@ -374,12 +399,13 @@ function pageOf(s) {
 }
 
 export function buildFast(input) {
-  const templates = new Map();
+  const compiled = new Map();
   const report = [];
   const tplKeys = Object.keys(input.templates).sort(byCodeUnits);
   for (const name of tplKeys) {
     try {
-      templates.set(name, parseTemplate(name, input.templates[name]));
+      const nodes = parseTemplate(name, input.templates[name]);
+      compiled.set(name, makeCompiledTemplate(nodes));
     } catch (err) {
       if (!(err instanceof TemplateError)) throw err;
       report.push(err.message);
@@ -416,7 +442,7 @@ export function buildFast(input) {
       continue;
     }
     const layout = s.data.layout ?? (s.post ? 'post' : 'page');
-    if (!templates.has(layout)) {
+    if (!compiled.has(layout)) {
       report.push(`refused ${s.path}: layout "${layout}" is no template that parses`);
       continue;
     }
@@ -500,11 +526,10 @@ export function buildFast(input) {
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
-  const ctx = { templates, escape: fastEscape };
 
   const render = (name, vars) => {
-    const nodes = templates.get(name);
-    return nodes === undefined ? null : renderNodesFast(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, ctx, 0);
+    const fn = compiled.get(name);
+    return fn === undefined ? null : fn({ vars: { site, tags: allTags, recent, ...vars }, parent: null }, compiled, fastEscape, textOfFast, lookupFast, truthyFast, 0);
   };
 
   const output = {};
