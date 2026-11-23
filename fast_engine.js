@@ -1,10 +1,9 @@
 // Fast drop-in static site generator for makefun-site 1.0.0
-// Ultra-optimized FastSite v3:
-// 1. AST JIT-Compiler for all templates (compiled to native JS functions)
-// 2. Fast regex guard for inline markdown (skips plain paragraphs in 1 check)
-// 3. Chunked zero-redundancy inline scanner with fast code-point lookup
-// 4. Linear HTML escaper without regex
-// 5. Inlined pipeline stages
+// Ultra-optimized FastSite v4:
+// 1. Direct compiled templates with inlined child includes & direct property lookups
+// 2. Fused single-pass Markdown parser (zero intermediate token objects)
+// 3. Fast line trimming and blank scanning via ASCII char-code loops
+// 4. Zero-allocation card & page representations
 
 import { parseFrontMatter } from './vendor/makefun-site/lib/frontmatter.js';
 import { parseTemplate, TemplateError } from './vendor/makefun-site/lib/template.js';
@@ -42,8 +41,26 @@ function resolvePath(dir, rel) {
 
 const dirOf = (path) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
 
+function isBlankFast(line) {
+  const len = line.length;
+  for (let i = 0; i < len; i++) {
+    const c = line.charCodeAt(i);
+    if (c !== 32 && c !== 9) return false;
+  }
+  return true;
+}
+
+function trimFast(line) {
+  let start = 0;
+  const len = line.length;
+  while (start < len && (line.charCodeAt(start) === 32 || line.charCodeAt(start) === 9)) start++;
+  if (start === len) return '';
+  let end = len - 1;
+  while (end > start && (line.charCodeAt(end) === 32 || line.charCodeAt(end) === 9)) end--;
+  return start === 0 && end === len - 1 ? line : line.slice(start, end + 1);
+}
+
 // Fast Markdown Parser
-const BLANK = /^[ \t]*$/;
 const FENCE_OPEN = /^```([A-Za-z0-9_+-]*)[ \t]*$/;
 const FENCE_CLOSE = /^```[ \t]*$/;
 const HEADING = /^(#{1,6})[ \t]+(.*?)[ \t]*$/;
@@ -54,15 +71,14 @@ const ORDERED = /^(\d{1,9})\. (.*)$/;
 const CONTINUED = /^ {2,}\S/;
 
 function headingOf(line) {
+  if (line.charCodeAt(0) !== 35) return null;
   const m = HEADING.exec(line);
   return m === null || m[2] === '' ? null : { depth: m[1].length, text: m[2] };
 }
 
 function endsParagraph(line) {
-  return BLANK.test(line) || FENCE_OPEN.test(line) || headingOf(line) !== null || HR.test(line);
+  return isBlankFast(line) || FENCE_OPEN.test(line) || headingOf(line) !== null || HR.test(line);
 }
-
-const trimLine = (line) => line.replace(/^[ \t]+|[ \t]+$/g, '');
 
 function findUnescapedFast(s, what, from) {
   const whatLen = what.length;
@@ -177,108 +193,88 @@ function fastInline(s, env) {
   return out;
 }
 
-function lex(src) {
+// Fused Single-Pass Markdown Renderer
+function renderMarkdownFast(src, env) {
+  const ids = new Set();
+  const blocks = [];
+  const toc = [];
+  let excerpt = null;
   const lines = src.split('\n');
-  const tokens = [];
+  const len = lines.length;
   let i = 0;
-  while (i < lines.length) {
+
+  while (i < len) {
     const line = lines[i];
-    if (BLANK.test(line)) {
+    if (isBlankFast(line)) {
       i++;
       continue;
     }
+
     const fence = FENCE_OPEN.exec(line);
     if (fence !== null) {
       const body = [];
       i++;
-      while (i < lines.length && !FENCE_CLOSE.test(lines[i])) body.push(lines[i++]);
+      while (i < len && !FENCE_CLOSE.test(lines[i])) body.push(lines[i++]);
       i++;
-      tokens.push({ type: 'code', lang: fence[1], lines: body });
+      const cls = fence[1] === '' ? '' : ` class="language-${fastEscape(fence[1])}"`;
+      blocks.push(`<pre><code${cls}>${body.map((l) => `${fastEscape(l)}\n`).join('')}</code></pre>`);
       continue;
     }
+
     const heading = headingOf(line);
     if (heading !== null) {
-      tokens.push({ type: 'heading', depth: heading.depth, text: heading.text });
+      const id = uniqueSlug(slugify(heading.text), ids);
+      const html = fastInline(heading.text, env);
+      blocks.push(`<h${heading.depth} id="${id}">${html}</h${heading.depth}>`);
+      if (heading.depth === 2 || heading.depth === 3) toc.push({ level: heading.depth, id, html });
       i++;
       continue;
     }
+
     if (HR.test(line)) {
-      tokens.push({ type: 'hr' });
+      blocks.push('<hr>');
       i++;
       continue;
     }
+
     if (QUOTE.test(line)) {
       const body = [];
-      while (i < lines.length && QUOTE.test(lines[i])) body.push(lines[i++].replace(/^> ?/, ''));
-      tokens.push({ type: 'blockquote', lines: body.map(trimLine).filter((l) => l !== '') });
+      while (i < len && QUOTE.test(lines[i])) body.push(lines[i++].replace(/^> ?/, ''));
+      const quoteLines = body.map(trimFast).filter((l) => l !== '');
+      blocks.push(quoteLines.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${fastInline(quoteLines.join('\n'), env)}</p>\n</blockquote>`);
       continue;
     }
+
     const bullet = BULLET.exec(line);
     const ordered = bullet === null ? ORDERED.exec(line) : null;
     if (bullet !== null || ordered !== null) {
       const isOrdered = ordered !== null;
       const marker = isOrdered ? ORDERED : BULLET;
       const items = [];
-      while (i < lines.length) {
+      while (i < len) {
         const m = marker.exec(lines[i]);
         if (m !== null) {
-          items.push([trimLine(isOrdered ? m[2] : m[1])]);
+          items.push([trimFast(isOrdered ? m[2] : m[1])]);
           i++;
         } else if (CONTINUED.test(lines[i])) {
-          items[items.length - 1].push(trimLine(lines[i]));
+          items[items.length - 1].push(trimFast(lines[i]));
           i++;
         } else break;
       }
-      tokens.push({ type: 'list', ordered: isOrdered, start: isOrdered ? Number(ordered[1]) : 1, items: items.map((parts) => parts.join('\n')) });
+      const tag = isOrdered ? 'ol' : 'ul';
+      const open = isOrdered && ordered[1] !== '1' ? `<ol start="${ordered[1]}">` : `<${tag}>`;
+      blocks.push(`${open}\n${items.map((parts) => `<li>${fastInline(parts.join('\n'), env)}</li>\n`).join('')}</${tag}>`);
       continue;
     }
-    const body = [trimLine(line)];
-    i++;
-    while (i < lines.length && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
-    tokens.push({ type: 'paragraph', text: body.join('\n') });
-  }
-  return tokens;
-}
 
-function renderMarkdownFast(src, env) {
-  const ids = new Set();
-  const blocks = [];
-  const toc = [];
-  let excerpt = null;
-  for (const t of lex(src)) {
-    switch (t.type) {
-      case 'heading': {
-        const id = uniqueSlug(slugify(t.text), ids);
-        const html = fastInline(t.text, env);
-        blocks.push(`<h${t.depth} id="${id}">${html}</h${t.depth}>`);
-        if (t.depth === 2 || t.depth === 3) toc.push({ level: t.depth, id, html });
-        break;
-      }
-      case 'code': {
-        const cls = t.lang === '' ? '' : ` class="language-${fastEscape(t.lang)}"`;
-        blocks.push(`<pre><code${cls}>${t.lines.map((l) => `${fastEscape(l)}\n`).join('')}</code></pre>`);
-        break;
-      }
-      case 'hr':
-        blocks.push('<hr>');
-        break;
-      case 'blockquote':
-        blocks.push(t.lines.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${fastInline(t.lines.join('\n'), env)}</p>\n</blockquote>`);
-        break;
-      case 'list': {
-        const tag = t.ordered ? 'ol' : 'ul';
-        const open = t.ordered && t.start !== 1 ? `<ol start="${t.start}">` : `<${tag}>`;
-        blocks.push(`${open}\n${t.items.map((item) => `<li>${fastInline(item, env)}</li>\n`).join('')}</${tag}>`);
-        break;
-      }
-      case 'paragraph': {
-        const html = fastInline(t.text, env);
-        if (excerpt === null) excerpt = html;
-        blocks.push(`<p>${html}</p>`);
-        break;
-      }
-    }
+    const body = [trimFast(line)];
+    i++;
+    while (i < len && !endsParagraph(lines[i])) body.push(trimFast(lines[i++]));
+    const html = fastInline(body.join('\n'), env);
+    if (excerpt === null) excerpt = html;
+    blocks.push(`<p>${html}</p>`);
   }
+
   return { html: blocks.map((b) => `${b}\n`).join(''), toc, excerpt: excerpt ?? '' };
 }
 
@@ -308,6 +304,34 @@ function textOfFast(v) {
 function truthyFast(v) {
   if (Array.isArray(v)) return v.length > 0;
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
+}
+
+function inlineTemplateIncludes(nodes, templates, depth = 0) {
+  const res = [];
+  for (const n of nodes) {
+    if (n.kind === 'include') {
+      const sub = templates.get(n.name);
+      if (sub && depth < 8) {
+        res.push(...inlineTemplateIncludes(sub, templates, depth + 1));
+      } else {
+        res.push(n);
+      }
+    } else if (n.kind === 'if') {
+      res.push({
+        ...n,
+        then: inlineTemplateIncludes(n.then, templates, depth),
+        else: n.else ? inlineTemplateIncludes(n.else, templates, depth) : null,
+      });
+    } else if (n.kind === 'for') {
+      res.push({
+        ...n,
+        body: inlineTemplateIncludes(n.body, templates, depth),
+      });
+    } else {
+      res.push(n);
+    }
+  }
+  return res;
 }
 
 function compileAST(nodes) {
@@ -399,17 +423,22 @@ function pageOf(s) {
 }
 
 export function buildFast(input) {
-  const compiled = new Map();
+  const parsedMap = new Map();
   const report = [];
   const tplKeys = Object.keys(input.templates).sort(byCodeUnits);
   for (const name of tplKeys) {
     try {
-      const nodes = parseTemplate(name, input.templates[name]);
-      compiled.set(name, makeCompiledTemplate(nodes));
+      parsedMap.set(name, parseTemplate(name, input.templates[name]));
     } catch (err) {
       if (!(err instanceof TemplateError)) throw err;
       report.push(err.message);
     }
+  }
+
+  const compiled = new Map();
+  for (const [name, nodes] of parsedMap.entries()) {
+    const inlined = inlineTemplateIncludes(nodes, parsedMap);
+    compiled.set(name, makeCompiledTemplate(inlined));
   }
 
   const base = input.site.base_url.replace(/\/+$/, '');
