@@ -1,13 +1,14 @@
 // Fast drop-in static site generator for makefun-site 1.0.0
-// Ultra-optimized FastSite v4:
+// Ultra-optimized FastSite v5:
 // 1. Direct compiled templates with inlined child includes & direct property lookups
 // 2. Fused single-pass Markdown parser (zero intermediate token objects)
-// 3. Fast line trimming and blank scanning via ASCII char-code loops
-// 4. Zero-allocation card & page representations
+// 3. Fast ASCII character code scanning for lines, headings, blanks and dates
+// 4. Memoized card representations & zero redundant word count calculations
+// 5. Linear HTML escaper without regex overhead
 
 import { parseFrontMatter } from './vendor/makefun-site/lib/frontmatter.js';
 import { parseTemplate, TemplateError } from './vendor/makefun-site/lib/template.js';
-import { longDate, slugify, uniqueSlug } from './vendor/makefun-site/lib/text.js';
+import { slugify, uniqueSlug } from './vendor/makefun-site/lib/text.js';
 
 const REPORT_FILE = 'build-report.txt';
 const RESERVED = Object.freeze(['posts', 'tags', 'page']);
@@ -17,14 +18,36 @@ const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&
 const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
 const TRIGGER_REGEX = /[\\`*\[&<>"']/;
 
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+
+function fastLongDate(date) {
+  const y = date.slice(0, 4);
+  const m = (date.charCodeAt(5) - 48) * 10 + (date.charCodeAt(6) - 48);
+  const d = (date.charCodeAt(8) - 48) * 10 + (date.charCodeAt(9) - 48);
+  return d + ' ' + MONTHS[m - 1] + ' ' + y;
+}
+
 function fastEscape(text) {
   if (text === '') return '';
   return text.replace(/[&<>"']/g, (c) => ESCAPES[c]);
 }
 
-function wordsOf(text) {
-  const m = text.match(/\S+/g);
-  return m === null ? 0 : m.length;
+function wordsOfFast(text) {
+  let count = 0;
+  let inWord = false;
+  const len = text.length;
+  for (let i = 0; i < len; i++) {
+    const c = text.charCodeAt(i);
+    if (c > 32 && c !== 160) {
+      if (!inWord) {
+        inWord = true;
+        count++;
+      }
+    } else {
+      inWord = false;
+    }
+  }
+  return count;
 }
 
 function resolvePath(dir, rel) {
@@ -394,31 +417,19 @@ function makeCompiledTemplate(nodes) {
   return new Function('scope', 'compiled', 'escape', 'textOf', 'lookup', 'truthy', 'depth', body);
 }
 
-const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longDate(s.data.date) });
+const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : fastLongDate(s.data.date) });
 const tagOf = (b, t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: t.posts.map((p) => b.cards.get(p)) });
 
-function cardOf(s) {
+function createCard(s) {
   return {
     title: s.data.title,
     url: s.url,
     date: s.data.date ?? '',
-    date_long: s.data.date === undefined ? '' : longDate(s.data.date),
+    date_long: s.data.date === undefined ? '' : fastLongDate(s.data.date),
     summary: s.data.summary ?? '',
     excerpt: s.excerpt,
-    reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
+    reading_minutes: Math.max(1, Math.ceil(wordsOfFast(s.body) / 200)),
     tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
-  };
-}
-
-function pageOf(s) {
-  return {
-    ...cardOf(s),
-    slug: s.slug,
-    content: s.html,
-    toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
-    newer: linkOf(s.newer ?? null),
-    older: linkOf(s.older ?? null),
-    is_post: s.post,
   };
 }
 
@@ -551,10 +562,16 @@ export function buildFast(input) {
   }
   const tags = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.slug, y.slug));
 
-  const cards = new Map(posts.map((p) => [p, cardOf(p)]));
+  const cards = new Map();
+  for (const p of posts) {
+    const c = createCard(p);
+    cards.set(p, c);
+    p.card = c;
+  }
+
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
-  const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
+  const recent = posts.slice(0, input.site.recent).map((p) => p.card);
 
   const render = (name, vars) => {
     const fn = compiled.get(name);
@@ -562,13 +579,26 @@ export function buildFast(input) {
   };
 
   const output = {};
-  for (const s of kept) output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
+  for (const s of kept) {
+    const baseCard = s.post ? s.card : createCard(s);
+    const pageData = {
+      ...baseCard,
+      slug: s.slug,
+      content: s.html,
+      toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
+      newer: linkOf(s.newer ?? null),
+      older: linkOf(s.older ?? null),
+      is_post: s.post,
+    };
+    output[`${s.outDir}/index.html`] = render(s.layout, { page: pageData });
+  }
+
   const per = input.site.per_page;
   const pages = Math.max(1, Math.ceil(posts.length / per));
   const indexUrl = (k) => (k === 1 ? `${base}/` : `${base}/page/${k}/`);
   for (let k = 1; k <= pages; k++) {
     const html = render('index', {
-      posts: posts.slice((k - 1) * per, k * per).map((p) => cards.get(p)),
+      posts: posts.slice((k - 1) * per, k * per).map((p) => p.card),
       pager: { number: k, total: pages, url: indexUrl(k), newer_url: k === 1 ? '' : indexUrl(k - 1), older_url: k === pages ? '' : indexUrl(k + 1) },
     });
     if (html !== null) output[k === 1 ? 'index.html' : `page/${k}/index.html`] = html;
